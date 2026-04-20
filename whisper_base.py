@@ -53,9 +53,10 @@ INITIAL_PROMPT = (
 
 LOCK_FILE = "/tmp/whisper_active.pid"
 
-JOURNAL_DIR = os.path.join(VAULT_PATH, "Daily journal")
-INBOX_DIR   = os.path.join(VAULT_PATH, "Inbox")
-BOOKS_DIR   = os.path.join(VAULT_PATH, "Books")
+JOURNAL_DIR   = os.path.join(VAULT_PATH, "Planner/Daily")
+JOURNAL_TPL   = os.path.join(VAULT_PATH, "Planner/Templates/daily.md")
+INBOX_DIR     = os.path.join(VAULT_PATH, "Inbox")
+BOOKS_DIR     = os.path.join(VAULT_PATH, "Books")
 
 # ── logging setup ─────────────────────────────────────
 LOG_FILE = os.path.join(os.path.dirname(VAULT_PATH), "whisper_debug.log")
@@ -299,6 +300,60 @@ def _match_book(spoken_text, books_dir):
     logger.info(f"Book match result: '{best_book}' with confidence {best_score:.2f}")
     return best_book, best_score
 
+def _insert_into_voice_capture(filepath, text):
+    """
+    Append transcription text into the ## 🎙 Voice Capture section of a daily note.
+    Inserts before the closing --- of that section (or at end of file if none found).
+    If the section doesn't exist, falls back to appending at end of file.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        # Find the Voice Capture heading line
+        vc_idx = None
+        for i, line in enumerate(lines):
+            if re.match(r"^##\s+🎙\s+Voice Capture", line.strip()):
+                vc_idx = i
+                break
+
+        if vc_idx is None:
+            # Section not found — fall back to appending
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(f"\n{text}")
+            return
+
+        # Find the next --- separator after the Voice Capture heading
+        insert_before = len(lines)  # default: end of file
+        for i in range(vc_idx + 1, len(lines)):
+            if lines[i].strip() == "---":
+                insert_before = i
+                break
+
+        # Build the new line(s) to insert
+        new_line = f"{text}\n"
+
+        # Check if there's already content between heading and ---
+        # (skip blank lines when checking)
+        content_between = [
+            l for l in lines[vc_idx + 1:insert_before] if l.strip()
+        ]
+        if content_between:
+            # Append after existing content, before the ---
+            lines.insert(insert_before, new_line)
+        else:
+            # Insert right after the heading (+ blank line)
+            lines.insert(vc_idx + 1, new_line)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception:
+        logger.error("Error inserting into Voice Capture section", exc_info=True)
+        # Last-resort fallback
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(f"\n{text}")
+
+
 def _git_commit_sync(mode, out_path):
     """Synchronous git add+commit; returns True if anything was committed."""
     try:
@@ -337,6 +392,8 @@ class WhisperWindow(Gtk.Window):
         self.chunks      = 0
         self.load_start  = time.time()
         self.countdown   = LOAD_SECONDS
+        # Live microphone amplitude fed by _level_monitor thread (0.0=silent, 1.0=loud)
+        self.audio_level = 0.0
 
         icon = {"journal": "📔", "inbox": "💡", "system": "🎙"}.get(mode, "🎙")
         mode_name = {"journal": "Journal", "inbox": "Inbox",
@@ -349,6 +406,11 @@ class WhisperWindow(Gtk.Window):
         self.set_keep_above(True)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("delete-event", self._on_close)
+
+        # In system (dictate) mode, do NOT steal keyboard focus from the
+        # target application — otherwise xdotool types into the Whisper window.
+        if mode == "system":
+            self.set_accept_focus(False)
 
         # styling
         css = b"""
@@ -529,20 +591,36 @@ class WhisperWindow(Gtk.Window):
             cr.stroke()
             return
 
-        # animated waveform bars
+        # ── Live microphone-reactive waveform ────────────────────────
         bars  = 20
         bw    = 8
         gap   = 5
         total = bars * (bw + gap) - gap
         x0    = cx - total / 2
 
+        # audio_level: 0.0 = silence, 1.0 = loud voice (written by _level_monitor thread)
+        level = self.audio_level
+
         for i in range(bars):
-            amp   = 0.25 + 0.75 * abs(math.sin(self.phase + i * 0.42))
-            bar_h = 5 + amp * 32
+            # Gentle lateral shimmer: phase-driven, but weight fades when speaking
+            shimmer = abs(math.sin(self.phase + i * 0.42))
+
+            # Bar height:
+            #   silent  (level≈0) → 3–7 px idle shimmer
+            #   loud    (level≈1) → 8–55 px reactive peak
+            bar_h = 3 + shimmer * 4 * (1.0 - level) + level * (8 + shimmer * 47)
+
             x     = x0 + i * (bw + gap)
             y     = cy - bar_h / 2
-            alpha = 0.45 + 0.55 * amp
-            cr.set_source_rgba(0.8, 0.65, 0.97, alpha)
+
+            # Alpha: dim at idle, bright when speaking
+            alpha = 0.25 + 0.15 * shimmer * (1.0 - level) + level * (0.65 + 0.35 * shimmer)
+
+            # Color: soft purple at idle → bright violet when loud
+            r = 0.80 + level * 0.15
+            g = 0.65 + level * 0.20
+            b = 0.97
+            cr.set_source_rgba(r, g, b, alpha)
             self._rrect(cr, x, y, bw, bar_h, 3)
             cr.fill()
 
@@ -563,6 +641,62 @@ class WhisperWindow(Gtk.Window):
         return True  # Prevent window close until fully processed
 
 
+# ── live microphone level monitor ────────────────────
+def _level_monitor(win_ref, stop_event):
+    """
+    Daemon thread: opens a lightweight PyAudio input stream, reads audio
+    every ~64 ms, computes RMS amplitude, applies asymmetric exponential
+    smoothing, and writes the result into win_ref[0].audio_level (0.0–1.0).
+
+    Uses a completely separate stream from the main record() thread so it
+    never steals frames from the Whisper audio queue.
+    """
+    CHUNK   = 1024    # ~64 ms at 16 kHz
+    RATE    = 16000
+    SMOOTH  = 0.25    # attack: how fast level rises  (higher = snappier)
+    DECAY   = 0.125   # release: how fast level falls  (lower  = slower decay)
+    SILENCE = 0.005   # RMS below this threshold → treat as silence
+    PEAK    = 0.15    # RMS that maps to audio_level = 1.0
+
+    try:
+        pa     = pyaudio.PyAudio()
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK,
+        )
+        smoothed = 0.0
+
+        while not stop_event.is_set():
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+            except Exception:
+                break
+
+            samples   = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            rms       = float(np.sqrt(np.mean(samples ** 2)))
+            raw_level = min(rms / PEAK, 1.0) if rms > SILENCE else 0.0
+
+            # Asymmetric smoothing: fast attack, slow decay
+            if raw_level > smoothed:
+                smoothed = SMOOTH * raw_level + (1.0 - SMOOTH) * smoothed
+            else:
+                smoothed = DECAY  * raw_level + (1.0 - DECAY)  * smoothed
+
+            # GIL makes float assignment atomic — no lock needed
+            if win_ref[0] is not None:
+                win_ref[0].audio_level = smoothed
+
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+    except Exception:
+        logger.warning("Level monitor failed to start — waveform will use idle shimmer",
+                       exc_info=True)
+
+
 # ── core runner ───────────────────────────────────────
 def run(mode):
     # ── enforce single instance ───────────────────────
@@ -577,9 +711,60 @@ def run(mode):
 
     # out_path is a list so inner functions can mutate it (closure reference)
     out_path = [None]
+
+    # ── system mode: remember the currently focused window BEFORE our GTK
+    #    overlay steals the screen, so we can focus it back before typing.
+    target_wid = [None]
+    if mode == "system":
+        try:
+            result = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                capture_output=True, text=True, timeout=3
+            )
+            wid = result.stdout.strip()
+            if wid.isdigit():
+                target_wid[0] = wid
+        except Exception:
+            pass  # xdotool unavailable — will still attempt to type
+
     if mode == "journal":
         os.makedirs(JOURNAL_DIR, exist_ok=True)
         out_path[0] = os.path.join(JOURNAL_DIR, datetime.now().strftime("%Y-%m-%d") + ".md")
+        # Create from template if this daily note doesn't exist yet
+        if not os.path.exists(out_path[0]):
+            if os.path.exists(JOURNAL_TPL):
+                with open(JOURNAL_TPL, "r", encoding="utf-8") as tpl:
+                    tpl_content = tpl.read()
+                # Substitute Templater placeholders with real values
+                today = datetime.now()
+                tpl_content = re.sub(
+                    r"<% tp\.date\.now\(['\"]YYYY-MM-DD['\"]\) %>",
+                    today.strftime("%Y-%m-%d"), tpl_content)
+                tpl_content = re.sub(
+                    r"<% tp\.date\.now\(['\"]dddd, MMMM DD, YYYY['\"]\) %>",
+                    today.strftime("%A, %B %d, %Y"), tpl_content)
+                with open(out_path[0], "w", encoding="utf-8") as f:
+                    f.write(tpl_content)
+            else:
+                # Fallback: minimal daily note with Voice Capture section
+                today = datetime.now()
+                with open(out_path[0], "w", encoding="utf-8") as f:
+                    f.write(
+                        f"---\ndate: {today.strftime('%Y-%m-%d')}\ntype: daily\n"
+                        f"focus_score: \nenergy_score: \nexecution_score: \n"
+                        f"did_high_priority: \ndid_income_work: \ndid_learning: \n---\n\n"
+                        f"# 📅 {today.strftime('%A, %B %d, %Y')}\n\n"
+                        f"## 🔥 Highest Priority\n- [ ] \n\n---\n\n"
+                        f"## 💰 Income Work\n- [ ] \n\n---\n\n"
+                        f"## 🧠 Learning\n- [ ] \n\n---\n\n"
+                        f"## ✅ Tasks\n- [ ] \n\n---\n\n"
+                        f"## 🏆 One Win\n\n---\n\n"
+                        f"## ❌ One Thing to Fix\n\n---\n\n"
+                        f"## 📊 Score\nFocus: /10  \nEnergy: /10  \nExecution: /10  \n\n---\n\n"
+                        f"## 📝 How Today Went\n\n---\n\n"
+                        f"## 🎙 Voice Capture\n\n---\n\n"
+                        f"## ✅ Daily Summary\n- Highest priority done: \n- Income work done: \n- Learning done: \n"
+                    )
     elif mode == "inbox":
         os.makedirs(INBOX_DIR, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d-idea-%H-%M")
@@ -591,13 +776,15 @@ def run(mode):
         # For 'book' mode, the path will dynamically resolve in transcribe() based on the first few words.
         pass
 
-    win = [None]
+    win        = [None]
+    level_stop = threading.Event()   # signals _level_monitor to exit
 
     def on_stop():
         """Called when the user closes the window / clicks Stop."""
         if stop_record_event.is_set():
             return
         stop_record_event.set()
+        level_stop.set()              # stop the level-monitor thread
         if win[0]:
             GLib.idle_add(win[0].set_saving)
 
@@ -613,6 +800,15 @@ def run(mode):
 
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, _on_sigterm)
         # ─────────────────────────────────────────────
+
+        # Start the live microphone level monitor for the reactive waveform.
+        # Runs only after the window exists so win_ref[0] is already set.
+        threading.Thread(
+            target=_level_monitor,
+            args=(win, level_stop),
+            daemon=True,
+            name="LevelMonitor",
+        ).start()
 
     GLib.idle_add(build_window)
 
@@ -677,8 +873,8 @@ def run(mode):
                     if not text:
                         continue
                     if mode == "journal":
-                        with open(out_path[0], "a", encoding="utf-8") as f:
-                            f.write(f"\n{text}")
+                        # Insert transcription inside ## 🎙 Voice Capture section
+                        _insert_into_voice_capture(out_path[0], text)
                     elif mode == "inbox":
                         with open(out_path[0], "a", encoding="utf-8") as f:
                             f.write(f"\n{text}")
@@ -700,9 +896,17 @@ def run(mode):
                         else:
                             with open(out_path[0], "a", encoding="utf-8") as f:
                                 f.write(f" {text}")
-                    else:  # system — type into focused window
-                        subprocess.Popen(["xdotool", "type", "--clearmodifiers",
-                                          "--delay", "15", text + " "])
+                    else:  # system — type into the original focused window
+                        cmd = ["xdotool"]
+                        if target_wid[0]:
+                            # Refocus the original window first, then type into it
+                            cmd += ["windowfocus", "--sync", target_wid[0],
+                                    "type", "--window", target_wid[0],
+                                    "--clearmodifiers", "--delay", "15", text + " "]
+                        else:
+                            # Fallback: type into whatever is currently focused
+                            cmd += ["type", "--clearmodifiers", "--delay", "15", text + " "]
+                        subprocess.Popen(cmd)
                     if win[0]:
                         win[0].increment_chunk()
             except Exception as e:
