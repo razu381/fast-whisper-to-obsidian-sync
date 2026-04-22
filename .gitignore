@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment (if ever added locally)
+.env
+.venv
+venv/
+
+# Secrets — never commit these
+*.env
+.env.*
+secrets.py
+secrets.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

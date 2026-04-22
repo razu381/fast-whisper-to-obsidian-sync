@@ -1,0 +1,34 @@
+# Session-Level Gemini Post-Processing Plan (Updated)
+
+## Goal
+Execute Gemini once at the end of the recording session to maximize grammar and context, while ensuring **zero data loss** if the app crashes, the computer dies, or the network drops.
+
+## The "Safety Net" Solution
+
+Instead of writing live to Obsidian (which makes replacing the text later very messy and dangerous for your notes), we will use a **Live Recovery File**.
+
+1. **Live Backup:** As you speak, the raw corrected text is written live to a temporary file (`~/.whisper_recovery.txt`). If your laptop battery dies mid-sentence, your text is safely stored there.
+2. **Buffer in Memory:** The chunks are also held in memory.
+3. **End of Session:** When you click "Stop", the full block is sent to Gemini.
+   - **If the network is fine:** Gemini perfectly formats it, it is saved securely to Obsidian, and the temporary recovery file is cleared.
+   - **If the network fails:** The system instantly catches the error and saves the RAW, unpolished text to Obsidian instead. You lose the fancy commas, but you *never* lose your words.
+
+### [MODIFY] `whisper_base.py`
+
+**1. Live Recovery File**
+Define `RECOVERY_FILE = os.path.expanduser("~/.whisper_recovery.txt")`.
+In the `transcribe()` loop, append every chunk's raw corrected text to this file live.
+
+**2. Buffer Text**
+Accumulate the corrected text chunks in a `session_text` list.
+
+**3. Move Gemini to the Background Save Thread**
+When you click "Stop", the `do_save_bg()` thread will:
+1. Join all accumulated chunks into one massive string.
+2. Send the entire string to `_gemini_polish()`. (Try/except block guarantees fallback to raw text if it fails).
+3. Perform the file I/O operations (inserting into the Journal, creating the Inbox file, or appending to the Book note).
+4. Clear the `RECOVERY_FILE`.
+5. Run the Git Commit and Git Push.
+
+**4. Exception for System Dictation Mode**
+System Dictation mode must bypass this and remain live chunk-by-chunk to allow real-time typing into web browsers or chat boxes.

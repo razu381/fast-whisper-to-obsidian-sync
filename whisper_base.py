@@ -33,23 +33,119 @@ import difflib
 VAULT_PATH   = "/home/razu/Courses/Notes/My notes"
 MODEL_SIZE   = "large-v3"    # Using the latest large model for best overall accuracy
 LANGUAGE     = "en"
-CHUNK_SECS   = 12
+CHUNK_SECS   = 20   # Increased from 12 → full sentences fit in one transcription call
 SAMPLE_RATE  = 16000
 LOAD_SECONDS = 30   # estimated model load time for countdown
 
 # Provide common vocabulary (jargon, names) so Whisper knows how to spell them!
 # Add your own custom words separated by commas.
+# Contextual sentences are FAR more effective than a word list.
+# Whisper's language model sees these as preceding speech — it will
+# copy the exact spellings and style into its output.
 INITIAL_PROMPT = (
-    "Alex Hormozi, ThirdEyeRebels, BebaCo, Haramain Apparels, razu-dev-portfolio, "
-    "Fiverr, WooCommerce, Elementor, Elementor Pro, WPFunnels, JetEngine, WordPress, "
-    "headless WordPress, Next.js, TailwindCSS, TypeScript, Framer Motion, Framer, "
-    "Shadcn, GSAP, Astro, Turbopack, Playwright, GitHub Actions, Lovable, Obsidian, "
-    "Pluckeye, JetBrains Mono, Ubuntu, ThemeForest, Envato, Creative Market, UI8, "
-    "Gumroad, Dark Commerce, Success Score, CTR, Level Zero, brutalist, regalwatchbd, "
-    "paramedical, Health Informatics, Medical Informatics, IELTS, Noakhali, "
-    "Freelancer Algorithm, Passive Income, MCP, Claude Code, Lara Casta, UI, Linux, GTK, Git"
+    "I work as a freelance web developer on Fiverr, building WooCommerce stores "
+    "with Elementor Pro, JetEngine, and WPFunnels for clients. "
+    "For headless WordPress projects I use Next.js, TypeScript, TailwindCSS, "
+    "GSAP, Framer Motion, Shadcn, Astro, and Turbopack. "
+    "My workflow includes GitHub Actions, Playwright, Lovable, Claude Code, and MCP. "
+    "I organise everything in my Obsidian vault and track brands like "
+    "ThirdEyeRebels, BebaCo, Haramain Apparels, and regalwatchbd. "
+    "I read books by Alex Hormozi and study Health Informatics in Noakhali. "
+    "I measure progress with metrics like CTR, Success Score, and Level Zero. "
+    "Daily tools include JetBrains Mono, Ubuntu, Linux, GTK, Git, Pluckeye, "
+    "ThemeForest, Envato, Creative Market, UI8, Gumroad, and Lara Casta."
 )
 # ──────────────────────────────────────────────────────
+
+# ── Gemini Flash post-processing ──────────────────────
+# Get a free key at https://aistudio.google.com/app/apikey
+# Set GEMINI_API_KEY="..." in ~/.bashrc or pass via env before running.
+GEMINI_ENABLED = True
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL   = "gemini-2.0-flash"
+GEMINI_PROMPT  = (
+    "You are a professional editor. Fix the punctuation, capitalisation, and "
+    "add natural paragraph breaks to this voice transcription. "
+    "Clean up the speech by removing filler words (like 'um', 'ah', 'like'), "
+    "false starts, and stuttering. "
+    "Otherwise, preserve the meaning and vocabulary exactly — do NOT rephrase or summarise. "
+    "Return ONLY the corrected text, nothing else. "
+    "Correct these domain terms if mis-spelled: "
+    "Fiverr, WooCommerce, Elementor, JetEngine, WordPress, Obsidian, GitHub, "
+    "TailwindCSS, TypeScript, Framer Motion, GSAP, Shadcn, Astro, Turbopack, "
+    "Playwright, ThirdEyeRebels, BebaCo, regalwatchbd, Haramain, Noakhali.\n\n"
+    "Transcript:\n{text}"
+)
+# ──────────────────────────────────────────────────────
+
+# ── Deterministic word-correction map ─────────────────
+# Catches stubborn mis-transcriptions that bypass the prompt.
+# Add new patterns here as you discover them in your notes.
+_CORRECTIONS = [
+    # Fiverr mis-hearings
+    (r'\bfiver\b',        'Fiverr'),
+    (r'\bfibre\b',        'Fiverr'),
+    (r'\bfever r\b',      'Fiverr'),
+    (r'\bfive r\b',       'Fiverr'),
+    (r'\bfree var\b',     'Fiverr'),
+    # Platform / tool names
+    (r'\bwoo commerce\b', 'WooCommerce'),
+    (r'\bwoo-commerce\b', 'WooCommerce'),
+    (r'\bword press\b',   'WordPress'),
+    (r'\bjet engine\b',   'JetEngine'),
+    (r'\bgit hub\b',      'GitHub'),
+    (r'\btailwind css\b', 'TailwindCSS'),
+    (r'\belementor pro\b','Elementor Pro'),
+    (r'\bnoakhali\b',     'Noakhali'),
+]
+
+def _apply_corrections(text: str) -> str:
+    """Apply regex-based deterministic word corrections to raw Whisper output."""
+    for pattern, replacement in _CORRECTIONS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+def _smart_join(segments_list) -> str:
+    """
+    Join Whisper segments into readable paragraphs.
+    Segments ending with sentence-terminal punctuation (.!?) get a line break.
+    Short trailing fragments are kept on the same line as the previous sentence.
+    """
+    lines  = []
+    buffer = []
+    for seg in segments_list:
+        t = seg.text.strip()
+        if not t:
+            continue
+        buffer.append(t)
+        if t[-1] in '.!?':
+            lines.append(' '.join(buffer))
+            buffer = []
+    if buffer:
+        lines.append(' '.join(buffer))
+    return '\n'.join(lines)
+
+
+def _gemini_polish(text: str) -> str:
+    """
+    Send raw transcription text to Gemini Flash for punctuation and
+    paragraph formatting. Falls back to raw text on any error.
+    Requires GEMINI_API_KEY env var and the google-genai package.
+    """
+    if not GEMINI_ENABLED or not GEMINI_API_KEY:
+        return text
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model_g = genai.GenerativeModel(GEMINI_MODEL)
+        prompt  = GEMINI_PROMPT.format(text=text)
+        response = model_g.generate_content(prompt)
+        polished = response.text.strip()
+        return polished if polished else text
+    except Exception:
+        logger.warning("Gemini polish failed — using raw corrected text", exc_info=True)
+        return text
 
 LOCK_FILE = "/tmp/whisper_active.pid"
 
@@ -865,11 +961,20 @@ def run(mode):
                         continue
                     segments, _ = model.transcribe(
                         audio, language=LANGUAGE,
-                        beam_size=5, vad_filter=True,
+                        beam_size=5,
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=500),
                         condition_on_previous_text=True,
                         initial_prompt=INITIAL_PROMPT,
+                        temperature=0.0,               # deterministic output — kills punctuation randomness
+                        compression_ratio_threshold=2.4, # reject repetitive/looping output
+                        log_prob_threshold=-1.0,        # skip very uncertain segments
+                        no_speech_threshold=0.6,        # stronger silence filter
                     )
-                    text = " ".join(s.text for s in segments).strip()
+                    segments_list = list(segments)     # consume generator before re-use
+                    raw_text  = _smart_join(segments_list).strip()        # sentence-aware line breaks
+                    corrected = _apply_corrections(raw_text)              # deterministic word fixes
+                    text      = _gemini_polish(corrected)                 # Gemini Flash polish
                     if not text:
                         continue
                     if mode == "journal":
