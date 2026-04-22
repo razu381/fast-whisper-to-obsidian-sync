@@ -5,30 +5,55 @@ Execute Gemini once at the end of the recording session to maximize grammar and 
 
 ## The "Safety Net" Solution
 
-Instead of writing live to Obsidian (which makes replacing the text later very messy and dangerous for your notes), we will use a **Live Recovery File**.
+Instead of writing live to Obsidian (which makes replacing the text later very messy and dangerous for your notes), we will use a **Live Recovery File** with a **startup recovery check**.
 
-1. **Live Backup:** As you speak, the raw corrected text is written live to a temporary file (`~/.whisper_recovery.txt`). If your laptop battery dies mid-sentence, your text is safely stored there.
-2. **Buffer in Memory:** The chunks are also held in memory.
-3. **End of Session:** When you click "Stop", the full block is sent to Gemini.
-   - **If the network is fine:** Gemini perfectly formats it, it is saved securely to Obsidian, and the temporary recovery file is cleared.
-   - **If the network fails:** The system instantly catches the error and saves the RAW, unpolished text to Obsidian instead. You lose the fancy commas, but you *never* lose your words.
+1. **Live Backup:** As you speak, the corrected text (after `_smart_join()` + `_apply_corrections()`) is written live to a temporary file (`~/.whisper_recovery.txt`). If your laptop battery dies mid-sentence, your text is safely stored there.
+2. **Buffer in Memory:** The corrected text chunks are also held in memory.
+3. **Startup Recovery Check:** When the app starts, if `~/.whisper_recovery.txt` exists, show a notification and move the text to `Inbox/` as a recovery note (e.g., `YYYY-MM-DD-recovered-HH-MM.md`), then delete the recovery file.
+4. **End of Session:** When you click "Stop", the full block is sent to Gemini.
+   - **If Gemini succeeds:** Gemini perfectly formats it, it is saved to Obsidian, the recovery file is **immediately deleted**, then git commit/push runs.
+   - **If Gemini fails (any reason):** The system catches the error and saves the raw corrected text to Obsidian instead. You lose the fancy commas, but you *never* lose your words.
 
 ### [MODIFY] `whisper_base.py`
 
 **1. Live Recovery File**
 Define `RECOVERY_FILE = os.path.expanduser("~/.whisper_recovery.txt")`.
-In the `transcribe()` loop, append every chunk's raw corrected text to this file live.
+In the `transcribe()` loop, append every chunk's corrected text (after `_smart_join()` + `_apply_corrections()`) to this file live. Flush after each write.
 
 **2. Buffer Text**
-Accumulate the corrected text chunks in a `session_text` list.
+Accumulate the corrected text chunks in a `session_text` list (in memory).
 
-**3. Move Gemini to the Background Save Thread**
-When you click "Stop", the `do_save_bg()` thread will:
-1. Join all accumulated chunks into one massive string.
-2. Send the entire string to `_gemini_polish()`. (Try/except block guarantees fallback to raw text if it fails).
-3. Perform the file I/O operations (inserting into the Journal, creating the Inbox file, or appending to the Book note).
-4. Clear the `RECOVERY_FILE`.
-5. Run the Git Commit and Git Push.
+**3. Post-Processing Pipeline (per-chunk, during recording)**
+Only `_smart_join()` and `_apply_corrections()` run on each chunk. `_gemini_polish()` is **removed** from the per-chunk loop — it moves to session-end only.
 
-**4. Exception for System Dictation Mode**
-System Dictation mode must bypass this and remain live chunk-by-chunk to allow real-time typing into web browsers or chat boxes.
+**4. Startup Recovery Check**
+At app launch, check if `~/.whisper_recovery.txt` exists and is non-empty.
+If yes:
+- Read its contents.
+- Show a desktop notification: "Unsaved session recovered."
+- Save the text as an Inbox note: `Inbox/YYYY-MM-DD-recovered-HH-MM.md`.
+- Delete the recovery file.
+
+**5. Move Gemini to the Background Save Thread**
+When you click "Stop", the recording loop must fully finish draining the audio queue **before** the save thread reads the recovery file or the in-memory buffer. The save thread (`do_save_bg()`) will:
+1. Join all accumulated chunks into one string.
+2. Send the entire string to `_gemini_polish()`.
+3. Validate Gemini's response (see point 6).
+4. Perform the file I/O operations (inserting into the Journal, creating the Inbox file, or appending to the Book note).
+5. **Immediately delete** the `RECOVERY_FILE` — before git commit, before anything else can fail.
+6. Run the Git Commit and Git Push.
+
+**6. Gemini Response Validation**
+After calling `_gemini_polish()`, validate the result before using it:
+- If `None` or empty string → use raw corrected text.
+- If suspiciously short (less than 30% of original length) → use raw corrected text.
+- If any exception occurs → use raw corrected text (already covered by try/except).
+- Only use the Gemini result if it passes all checks above.
+
+**7. Spinner UX — Two-Phase Spinner**
+After pressing Stop, show two distinct spinner states:
+- **Phase 1 ("Processing with AI..."):** While Gemini is processing the full session text.
+- **Phase 2 ("Syncing..."):** During file I/O, git commit, and git push.
+
+**8. Exception for System Dictation Mode**
+System Dictation mode must bypass all of the above and remain live chunk-by-chunk (including `_gemini_polish()` per chunk) to allow real-time typing into web browsers or chat boxes.

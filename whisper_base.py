@@ -78,6 +78,8 @@ GEMINI_PROMPT  = (
 )
 # ──────────────────────────────────────────────────────
 
+RECOVERY_FILE = os.path.expanduser("~/.whisper_recovery.txt")
+
 # ── Deterministic word-correction map ─────────────────
 # Catches stubborn mis-transcriptions that bypass the prompt.
 # Add new patterns here as you discover them in your notes.
@@ -147,6 +149,19 @@ def _gemini_polish(text: str) -> str:
         logger.warning("Gemini polish failed — using raw corrected text", exc_info=True)
         return text
 
+
+def _gemini_polish_safe(text: str) -> str:
+    if not text or not text.strip():
+        return text
+    polished = _gemini_polish(text)
+    if not polished or not polished.strip():
+        return text
+    if len(polished.strip()) < len(text.strip()) * 0.3:
+        logger.warning("Gemini response too short — using raw corrected text")
+        return text
+    return polished
+
+
 LOCK_FILE = "/tmp/whisper_active.pid"
 
 JOURNAL_DIR   = os.path.join(VAULT_PATH, "Planner/Daily")
@@ -182,6 +197,27 @@ os.dup2(devnull.fileno(), sys.stderr.fileno())
 
 def notify(title, msg, timeout=4000):
     subprocess.Popen(["notify-send", "-t", str(timeout), title, msg])
+
+
+def _check_recovery_file():
+    if not os.path.exists(RECOVERY_FILE):
+        return
+    try:
+        with open(RECOVERY_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            os.remove(RECOVERY_FILE)
+            return
+        os.makedirs(INBOX_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d-recovered-%H-%M")
+        out = os.path.join(INBOX_DIR, f"{ts}.md")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(f"# Recovered Session — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n{content}")
+        os.remove(RECOVERY_FILE)
+        notify("Whisper Recovery", "Unsaved session recovered and saved to Inbox.")
+        logger.info(f"Recovery file restored to {out}")
+    except Exception:
+        logger.error("Recovery file check failed", exc_info=True)
 
 
 # ── single-instance lock ──────────────────────────────
@@ -613,6 +649,14 @@ class WhisperWindow(Gtk.Window):
         self.btn.connect("clicked", self._force_quit)
         self.btn.set_sensitive(True)
 
+    def set_processing(self):
+        self.lbl_title.set_text("⏳ Processing with AI...")
+        self.lbl_hint.set_text("Gemini is polishing your transcription...")
+
+    def set_syncing(self):
+        self.lbl_title.set_text("⏳ Syncing...")
+        self.lbl_hint.set_text("Saving to Obsidian and syncing to Git...")
+
     def _force_quit(self, *args):
         try:
             _release_lock()
@@ -800,8 +844,8 @@ def run(mode):
     # The old session's SIGTERM handler commits its data before exiting.
     _kill_existing()
     _write_lock()
-    # ─────────────────────────────────────────────────
-
+    if mode != "system":
+        _check_recovery_file()
     stop_record_event = threading.Event()
     audio_queue       = queue.Queue()
 
@@ -948,13 +992,17 @@ def run(mode):
                 on_stop()
 
         def transcribe():
+            session_text = []
             try:
+                if mode != "system":
+                    open(RECOVERY_FILE, "w", encoding="utf-8").close()
+
                 while True:
                     try:
                         chunk = audio_queue.get(timeout=0.5)
                     except queue.Empty:
                         if stop_record_event.is_set():
-                            break  # Drained everything and recording stopped
+                            break
                         continue
                     audio = chunk.astype(np.float32) / 32768.0
                     if np.abs(audio).mean() < 0.005:
@@ -971,47 +1019,39 @@ def run(mode):
                         log_prob_threshold=-1.0,        # skip very uncertain segments
                         no_speech_threshold=0.6,        # stronger silence filter
                     )
-                    segments_list = list(segments)     # consume generator before re-use
-                    raw_text  = _smart_join(segments_list).strip()        # sentence-aware line breaks
-                    corrected = _apply_corrections(raw_text)              # deterministic word fixes
-                    text      = _gemini_polish(corrected)                 # Gemini Flash polish
-                    if not text:
-                        continue
-                    if mode == "journal":
-                        # Insert transcription inside ## 🎙 Voice Capture section
-                        _insert_into_voice_capture(out_path[0], text)
-                    elif mode == "inbox":
-                        with open(out_path[0], "a", encoding="utf-8") as f:
-                            f.write(f"\n{text}")
-                    elif mode == "book":
-                        if out_path[0] is None:
-                            # 3-layer matching: numbers → tokens → aliases
-                            best_book, confidence = _match_book(text, BOOKS_DIR)
-                            ts = datetime.now().strftime('%Y-%m-%d %H:%M')
-                            if confidence > 0.15 and best_book:
-                                out_path[0] = os.path.join(BOOKS_DIR, best_book)
-                                logger.info(f"Book matched: '{best_book}' (confidence={confidence:.2f})")
-                                with open(out_path[0], "a", encoding="utf-8") as f:
-                                    f.write(f"\n\n**[{ts}] Insight:** {text}")
-                            else:
-                                out_path[0] = os.path.join(BOOKS_DIR, "Unsorted_Notes.md")
-                                logger.warning(f"No book matched (best={best_book}, conf={confidence:.2f}). Saving to Unsorted.")
-                                with open(out_path[0], "a", encoding="utf-8") as f:
-                                    f.write(f"\n\n# Unsorted Note — {ts}\n{text}")
-                        else:
-                            with open(out_path[0], "a", encoding="utf-8") as f:
-                                f.write(f" {text}")
-                    else:  # system — type into the original focused window
+                    segments_list = list(segments)
+                    raw_text  = _smart_join(segments_list).strip()
+                    corrected = _apply_corrections(raw_text)
+
+                    if mode == "system":
+                        text = _gemini_polish(corrected)
+                        if not text:
+                            continue
                         cmd = ["xdotool"]
                         if target_wid[0]:
-                            # Refocus the original window first, then type into it
                             cmd += ["windowfocus", "--sync", target_wid[0],
                                     "type", "--window", target_wid[0],
                                     "--clearmodifiers", "--delay", "15", text + " "]
                         else:
-                            # Fallback: type into whatever is currently focused
                             cmd += ["type", "--clearmodifiers", "--delay", "15", text + " "]
                         subprocess.Popen(cmd)
+                    else:
+                        if not corrected:
+                            continue
+                        session_text.append(corrected)
+                        with open(RECOVERY_FILE, "a", encoding="utf-8") as rf:
+                            rf.write(corrected + "\n\n")
+                            rf.flush()
+                        if mode == "book" and out_path[0] is None and len(session_text) >= 2:
+                            full_accumulated = "\n\n".join(session_text)
+                            best_book, confidence = _match_book(full_accumulated, BOOKS_DIR)
+                            if confidence > 0.15 and best_book:
+                                out_path[0] = os.path.join(BOOKS_DIR, best_book)
+                                logger.info(f"Book matched: '{best_book}' (confidence={confidence:.2f})")
+                            else:
+                                out_path[0] = os.path.join(BOOKS_DIR, "Unsorted_Notes.md")
+                                logger.warning(f"No book matched (best={best_book}, conf={confidence:.2f}). Saving to Unsorted.")
+
                     if win[0]:
                         win[0].increment_chunk()
             except Exception as e:
@@ -1020,25 +1060,50 @@ def run(mode):
                 # --- TRANSCRIPTION FINISHED, CLEANUP AND EXIT ---
                 def do_save_bg():
                     _release_lock()
-                    if mode in ("journal", "inbox", "book"):
-                        committed = _git_commit_sync(mode, out_path[0])
-                        if committed:
-                            try:
-                                # Push blocks this background thread while the UI spinner keeps spinning
-                                subprocess.run(["git", "-C", VAULT_PATH, "push"], capture_output=True, timeout=60, check=True)
-                                if mode == "journal":
-                                    label = "✅ Journal saved & pushed"
-                                elif mode == "book":
-                                    label = f"✅ Book insight saved & pushed"
-                                else:
-                                    label = "✅ Idea saved & pushed"
-                            except Exception as e:
-                                label = f"⚠️ Commit saved, push failed: {e}"
-                        else:
-                            label = "⏹ Nothing to commit"
-                        notify("Whisper", label)
-                    else:
+                    if mode == "system":
                         notify("Whisper", "✅ Dictation stopped.")
+                    else:
+                        if session_text:
+                            if mode == "book" and out_path[0] is None:
+                                out_path[0] = os.path.join(BOOKS_DIR, "Unsorted_Notes.md")
+                            full_text = "\n\n".join(session_text)
+                            if win[0]:
+                                GLib.idle_add(win[0].set_processing)
+                            polished = _gemini_polish_safe(full_text)
+                            if win[0]:
+                                GLib.idle_add(win[0].set_syncing)
+                            if mode == "journal":
+                                _insert_into_voice_capture(out_path[0], polished)
+                            elif mode == "inbox":
+                                with open(out_path[0], "a", encoding="utf-8") as f:
+                                    f.write(f"\n{polished}")
+                            elif mode == "book":
+                                ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+                                with open(out_path[0], "a", encoding="utf-8") as f:
+                                    if "Unsorted_Notes" in out_path[0]:
+                                        f.write(f"\n\n# Unsorted Note — {ts}\n{polished}")
+                                    else:
+                                        f.write(f"\n\n**[{ts}] Insight:** {polished}")
+                            try:
+                                os.remove(RECOVERY_FILE)
+                            except OSError:
+                                pass
+                        if out_path[0]:
+                            committed = _git_commit_sync(mode, out_path[0])
+                            if committed:
+                                try:
+                                    subprocess.run(["git", "-C", VAULT_PATH, "push"], capture_output=True, timeout=60, check=True)
+                                    if mode == "journal":
+                                        label = "✅ Journal saved & pushed"
+                                    elif mode == "book":
+                                        label = "✅ Book insight saved & pushed"
+                                    else:
+                                        label = "✅ Idea saved & pushed"
+                                except Exception as e:
+                                    label = f"⚠️ Commit saved, push failed: {e}"
+                            else:
+                                label = "⏹ Nothing to commit"
+                            notify("Whisper", label)
                     
                     logger.info(f"Session finished (mode: {mode})")
                     # Close UI cleanly on main thread
